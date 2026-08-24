@@ -6,7 +6,7 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
-data/backtest_diagnostics.txt
+data/*_diagnostics.txt
 logs/*.log
 logs/*.log.*
 .venv/

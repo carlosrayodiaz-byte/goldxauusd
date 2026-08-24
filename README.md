@@ -5,6 +5,80 @@ Bot local en Python que se conecta a un terminal MetaTrader 5 (cuenta demo,
 Smart Money Concepts sobre XAUUSD, y registra cada deteccion en una base de
 datos SQLite local.
 
+## Ejecutar backtest real esta noche
+
+Pasos exactos, sin dar nada por sabido. Necesitas: Windows con el terminal
+MT5 ya instalado y una cuenta demo abierta (ver seccion 1 mas abajo si
+todavia no la tienes).
+
+**1. Clonar esta rama** (abre una terminal / PowerShell donde quieras el
+proyecto):
+```bash
+git clone --branch claude/xauusd-trading-signals-phase1-kj0va4 https://github.com/carlosrayodiaz-byte/goldxauusd.git
+cd goldxauusd
+```
+Si ya tenias el repo clonado de antes, en vez de clonar de nuevo:
+```bash
+cd goldxauusd
+git checkout claude/xauusd-trading-signals-phase1-kj0va4
+git pull origin claude/xauusd-trading-signals-phase1-kj0va4
+```
+
+**2. Crear el entorno virtual e instalar dependencias:**
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+(en Windows, `.venv\Scripts\activate`; si usas Git Bash es `source .venv/Scripts/activate`)
+
+**3. Configurar `.env`:**
+```bash
+copy .env.example .env
+```
+Abre `.env` con un editor de texto y rellena exactamente estos tres campos
+con los datos de TU cuenta demo (los mismos que usaste para loguearte en el
+terminal MT5 — estan en el correo de bienvenida del broker, o en
+**Herramientas > Opciones > Servidor** dentro del terminal):
+```
+MT5_LOGIN=<tu numero de cuenta demo, solo digitos>
+MT5_PASSWORD=<la password de la cuenta demo>
+MT5_SERVER=<el nombre EXACTO del servidor, ej. ICMarkets-Demo>
+```
+No hace falta tocar nada mas del `.env` (`MT5_TERMINAL_PATH` solo si tienes
+varios terminales MT5 instalados y quieres apuntar a uno especifico).
+
+**4. Dejar el terminal MT5 abierto y logueado** con esa misma cuenta demo
+(el bot se conecta al terminal que ya esta corriendo, no abre uno nuevo).
+
+**5. Confirmar el nombre exacto del simbolo del oro en tu broker:** en el
+Market Watch del terminal, busca el oro — puede llamarse `XAUUSD`,
+`XAUUSD.m`, `GOLD`, etc. Si NO es exactamente `XAUUSD`, pasalo con `--symbol`
+en el paso siguiente (o edita `SYMBOL` en `.env`).
+
+**6. Correr el backtest real (SIN `--dry-run`), pidiendo los ultimos 3 meses
+de M1:**
+```bash
+python backtest.py --months 3
+```
+O si tu simbolo no es `XAUUSD`:
+```bash
+python backtest.py --months 3 --symbol XAUUSD.m
+```
+Puede tardar varios minutos (descarga M1/M5/M15/H1 en bloques semanales).
+Al terminar vas a tener:
+- `data/signals.db` — la base de datos real, con `source="backtest"`.
+- `data/backtest_diagnostics.txt` — cobertura real de fechas, huecos,
+  duplicados, alineacion de timestamps entre timeframes, y el offset
+  estimado de zona horaria del servidor del broker.
+
+**Nota:** el flujo completo de este script (parseo de argumentos, motor SMC,
+escritura idempotente en SQLite, resumen final) ya quedo validado end-to-end
+en esta sesion con `python backtest.py --dry-run` (datos sinteticos, sin
+MT5) — ver mas abajo. Lo unico que no se pudo probar sin una maquina con MT5
+real es la conexion en si misma (`mt5.initialize()`, `copy_rates_range()`) y
+si tu broker realmente tiene 3 meses de historico M1 disponibles.
+
 ## Alcance de esta fase
 
 Incluido:
@@ -96,6 +170,11 @@ tabla `signals`:
   llegaron realmente — util si el broker no tiene los 3 meses completos).
 - Timestamps duplicados y huecos de tiempo (>4h) en las velas descargadas
   (fines de semana normales, o caidas de feed del broker).
+- Velas mal alineadas al limite de minuto esperado por timeframe (M5 en
+  multiplos de 5, M15 en multiplos de 15, H1 en minuto 0) y si la zona
+  horaria de la columna `time` es consistente ENTRE los cuatro timeframes
+  (deberian venir todas del mismo reloj de servidor; si difieren, es un bug
+  real, no la limitacion de offset conocida).
 - El offset estimado entre el reloj del servidor del broker y UTC real (ver
   limitacion de zona horaria mas abajo).
 - Ventanas de 2+ dias seguidos sin ninguna senal generada (M1+M5), con
@@ -104,6 +183,23 @@ tabla `signals`:
 Revisa `data/backtest_diagnostics.txt` y la base de datos (con cualquier
 cliente SQLite, ej. `DB Browser for SQLite`, o `sqlite3 data/signals.db`)
 para inspeccionar las senales antes de confiar en el motor.
+
+### Modo `--dry-run` (sin MT5, solo para validar el flujo del script)
+
+```bash
+python backtest.py --dry-run
+```
+
+No conecta a MT5: genera OHLC sintetico (los mismos generadores que usa
+`tests/conftest.py`) y corre el mismo flujo completo — parseo de argumentos,
+calculo de bias/triggers, escritura idempotente en SQLite, reporte de
+diagnostico y resumen final. Escribe en archivos **separados**
+(`data/dry_run_signals.db` y `data/dry_run_diagnostics.txt`) para no mezclar
+nunca datos falsos con un backtest real. Sirve para comprobar que el script
+en si no esta roto antes de tener acceso a MT5; **no reemplaza** al backtest
+real de la seccion anterior, porque no valida nada de la conexion a MT5 ni
+de la calidad de los datos reales del broker. Tambien se puede activar con
+la variable de entorno `BACKTEST_DRY_RUN=1` en vez del flag.
 
 ## 5. Correr en vivo: `main.py`
 

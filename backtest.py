@@ -14,18 +14,25 @@ corriendo en vivo minuto a minuto, sin usar informacion futura.
 Ademas de guardar las senales, escribe un reporte de diagnostico
 (data/backtest_diagnostics.txt) con lo que NO cabe en la tabla `signals`:
 cobertura real de datos por timeframe, huecos sospechosos en las velas
-descargadas, duplicados, el offset estimado del reloj del servidor MT5 vs
-UTC real, y ventanas de varios dias seguidos sin ninguna senal generada.
+descargadas, duplicados, timestamps mal alineados o con zona horaria
+inconsistente ENTRE timeframes, el offset estimado del reloj del servidor
+MT5 vs UTC real, y ventanas de varios dias seguidos sin ninguna senal
+generada.
 
-Uso:
+Uso (real, conecta a MT5):
     python backtest.py --months 3
+
+Uso (dry-run, SIN conectar a MT5, valida solo el flujo del script con datos
+sinteticos de tests/conftest.py -- no sustituye al backtest real):
+    python backtest.py --dry-run
 """
 import argparse
 import logging
+import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -40,6 +47,10 @@ logger = logging.getLogger("xauusd_backtest")
 GAP_THRESHOLD_HOURS = 4.0  # huecos en las velas crudas por encima de esto se reportan
 MIN_SIGNAL_GAP_DAYS = 2    # ventanas sin ninguna senal de al menos N dias seguidos
 
+# Minuto en el que debe caer el open de una vela de cada timeframe, para
+# detectar timestamps corridos / inconsistentes entre timeframes.
+EXPECTED_MINUTE_MODULO = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest del motor SMC sobre historico de MT5.")
@@ -48,6 +59,17 @@ def parse_args() -> argparse.Namespace:
         help=f"Meses de historico a descargar (default: {config.BACKTEST_MONTHS})",
     )
     parser.add_argument("--symbol", type=str, default=config.SYMBOL)
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        default=os.getenv("BACKTEST_DRY_RUN", "").lower() in ("1", "true", "yes"),
+        help=(
+            "No conecta a MT5: usa OHLC sintetico (tests/conftest.py) para validar "
+            "el flujo completo del script (parseo, motor SMC, escritura en SQLite, "
+            "resumen final). Escribe en data/dry_run_signals.db, NUNCA en la base "
+            "real, para no mezclar datos falsos con un backtest real. "
+            "Tambien se puede activar con BACKTEST_DRY_RUN=1."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -83,6 +105,40 @@ def _diagnose_ohlc(df: pd.DataFrame, timeframe: str, gap_threshold_hours: float 
         "duplicate_timestamps": duplicate_timestamps,
         "gaps": gaps,
     }
+
+
+def _check_timeframe_alignment(df: pd.DataFrame, timeframe: str) -> dict:
+    """Verifica que las velas de este timeframe caen en el limite de minuto
+    esperado (M5 en multiplos de 5, M15 en multiplos de 15, H1 en minuto 0).
+    Una vela mal alineada sugiere timestamps corridos o mal calculados."""
+    if df.empty:
+        return {"timeframe": timeframe, "misaligned_count": 0, "examples": []}
+
+    modulo = EXPECTED_MINUTE_MODULO.get(timeframe, 1)
+    minute = df["time"].dt.minute
+    aligned = (minute % modulo) == 0
+    misaligned = df.loc[~aligned, "time"]
+    return {
+        "timeframe": timeframe,
+        "misaligned_count": int((~aligned).sum()),
+        "examples": misaligned.head(5).tolist(),
+    }
+
+
+def _check_tz_consistency(dataframes: Dict[str, pd.DataFrame]) -> dict:
+    """Compara la zona horaria de la columna `time` ENTRE timeframes. Todas
+    deberian venir del mismo reloj de servidor MT5 (ver README: se etiquetan
+    como UTC aunque en realidad sean hora del servidor del broker); si algun
+    timeframe difiere, es una senal de bug real, no solo del offset conocido."""
+    tz_by_timeframe = {}
+    for tf, df in dataframes.items():
+        if df.empty:
+            tz_by_timeframe[tf] = None
+        else:
+            tz_by_timeframe[tf] = str(df["time"].dt.tz)
+    non_null = [tz for tz in tz_by_timeframe.values() if tz is not None]
+    consistent = len(set(non_null)) <= 1
+    return {"tz_by_timeframe": tz_by_timeframe, "consistent": consistent}
 
 
 def _signal_gap_windows(
@@ -142,14 +198,20 @@ def _write_diagnostics_report(
     date_to: datetime,
     offset_hours: Optional[float],
     ohlc_diagnostics: List[dict],
+    alignment_diagnostics: List[dict],
+    tz_diagnostics: dict,
     gap_windows: List[dict],
     stats: Counter,
     by_type_conf: Counter,
+    dry_run: bool = False,
 ) -> None:
     lines = []
-    lines.append(f"Backtest diagnostics — {symbol}")
+    header = f"Backtest diagnostics — {symbol}" + (" [DRY-RUN: datos sinteticos, NO reales]" if dry_run else "")
+    lines.append(header)
     lines.append(f"Generado (UTC): {datetime.now(timezone.utc).isoformat()}")
-    lines.append(f"Rango solicitado: {date_from.isoformat()} -> {date_to.isoformat()}")
+    lines.append(f"Rango cubierto: {date_from.isoformat()} -> {date_to.isoformat()}")
+    if dry_run:
+        lines.append("MODO DRY-RUN: no hubo conexion a MT5. Esto valida el flujo del script, NO sustituye al backtest real.")
     if offset_hours is not None:
         lines.append(
             f"Offset estimado servidor MT5 vs UTC real: {offset_hours:+.2f} horas "
@@ -157,7 +219,7 @@ def _write_diagnostics_report(
             "en hora del servidor del broker, etiquetados como UTC)"
         )
     else:
-        lines.append("Offset estimado servidor MT5 vs UTC real: no se pudo estimar (sin tick reciente)")
+        lines.append("Offset estimado servidor MT5 vs UTC real: no disponible (dry-run o sin tick reciente)")
     lines.append("")
 
     lines.append("== Cobertura real de datos OHLC descargados ==")
@@ -175,6 +237,22 @@ def _write_diagnostics_report(
                 lines.append(f"    {g['start']} -> {g['end']}  ({g['duration_hours']:.1f}h)")
         else:
             lines.append(f"  sin huecos > {GAP_THRESHOLD_HOURS}h")
+    lines.append("")
+
+    lines.append("== Alineacion de timestamps por timeframe ==")
+    for a in alignment_diagnostics:
+        if a["misaligned_count"] == 0:
+            lines.append(f"{a['timeframe']}: OK (todas las velas caen en el limite de minuto esperado)")
+        else:
+            lines.append(
+                f"{a['timeframe']}: {a['misaligned_count']} velas MAL ALINEADAS "
+                f"(ejemplos: {a['examples']})"
+            )
+    lines.append("")
+
+    lines.append("== Consistencia de zona horaria entre timeframes ==")
+    lines.append(f"tz por timeframe: {tz_diagnostics['tz_by_timeframe']}")
+    lines.append("Consistente entre timeframes: " + ("SI" if tz_diagnostics["consistent"] else "NO -- REVISAR, esto es un bug, no la limitacion conocida de offset"))
     lines.append("")
 
     lines.append(f"== Ventanas de {MIN_SIGNAL_GAP_DAYS}+ dias seguidos sin NINGUNA senal (M1+M5) ==")
@@ -200,40 +278,73 @@ def _write_diagnostics_report(
     logger.info("Reporte de diagnostico escrito en %s", path)
 
 
-def run_backtest(months: int, symbol: str) -> None:
-    date_to = datetime.now(timezone.utc)
-    date_from = date_to - timedelta(days=months * 30)
-    logger.info("Backtest de %s: %s -> %s (%d meses solicitados)", symbol, date_from, date_to, months)
+def _make_dry_run_dataframes(symbol: str) -> Dict[str, pd.DataFrame]:
+    """OHLC sintetico (mismos generadores que tests/conftest.py) para poder
+    correr backtest.py de punta a punta sin conexion a MT5. Solo sirve para
+    validar el flujo del script (parseo de argumentos, motor SMC, escritura
+    en SQLite, resumen final); NO sustituye al backtest real contra MT5."""
+    from tests.conftest import make_synthetic_ohlc
 
-    client = MT5Client()
-    client.connect()
-    conn = database.init_db(config.DB_PATH)
+    logger.warning(
+        "DRY-RUN activo para %s: usando OHLC SINTETICO (tests/conftest.py), "
+        "NO se conecta a MT5. Esto valida el flujo del script, no el motor "
+        "contra datos reales.",
+        symbol,
+    )
+    days = 10
+    return {
+        "M1": make_synthetic_ohlc(n=days * 24 * 60, trend=0.02, volatility=0.4, seed=101, freq="1min"),
+        "M5": make_synthetic_ohlc(n=days * 24 * 12, trend=0.02, volatility=0.5, seed=102, freq="5min"),
+        "M15": make_synthetic_ohlc(n=days * 24 * 4, trend=0.03, volatility=0.6, seed=103, freq="15min"),
+        "H1": make_synthetic_ohlc(n=days * 24, trend=0.03, volatility=0.8, seed=104, freq="1h"),
+    }
 
-    try:
+
+def run_backtest(months: int, symbol: str, dry_run: bool = False) -> None:
+    client: Optional[MT5Client] = None
+    offset_hours: Optional[float] = None
+    ohlc_diagnostics = []
+
+    if dry_run:
+        db_path = str(Path(config.DB_PATH).parent / "dry_run_signals.db")
+        diagnostics_path = Path(config.DB_PATH).parent / "dry_run_diagnostics.txt"
+        dataframes = _make_dry_run_dataframes(symbol)
+        for tf in config.ALL_TIMEFRAMES:
+            diag = _diagnose_ohlc(dataframes[tf], tf)
+            ohlc_diagnostics.append(diag)
+            logger.info("%s (sintetico): %d velas | %s -> %s", tf, diag["n_candles"], diag["first_time"], diag["last_time"])
+        date_from = dataframes["M1"]["time"].min()
+        date_to = dataframes["M1"]["time"].max()
+    else:
+        db_path = config.DB_PATH
+        diagnostics_path = Path(config.DB_PATH).parent / "backtest_diagnostics.txt"
+        date_to = datetime.now(timezone.utc)
+        date_from = date_to - timedelta(days=months * 30)
+        logger.info("Backtest de %s: %s -> %s (%d meses solicitados)", symbol, date_from, date_to, months)
+
+        client = MT5Client()
+        client.connect()
         offset_hours = client.estimate_server_offset_hours(symbol)
         if offset_hours is not None:
             logger.info("Offset estimado servidor MT5 vs UTC real: %+.2f horas", offset_hours)
 
         logger.info("Descargando historico de MT5 (puede tardar varios minutos en M1)...")
         dataframes = {}
-        ohlc_diagnostics = []
         for tf in config.ALL_TIMEFRAMES:
             df = client.get_ohlc_range(symbol, tf, date_from, date_to)
             diag = _diagnose_ohlc(df, tf)
             ohlc_diagnostics.append(diag)
             if df.empty:
                 logger.warning("%s: SIN VELAS descargadas", tf)
-            else:
-                logger.info(
-                    "%s: %d velas descargadas | cobertura real: %s -> %s | duplicados=%d | huecos>%sh=%d",
-                    tf, diag["n_candles"], diag["first_time"], diag["last_time"],
-                    diag["duplicate_timestamps"], GAP_THRESHOLD_HOURS, len(diag["gaps"]),
-                )
-            if df.empty:
                 raise RuntimeError(
                     f"No se recibieron velas de {tf} para {symbol}. "
                     "Revisa el nombre del simbolo en el Market Watch de MT5 y el rango de fechas."
                 )
+            logger.info(
+                "%s: %d velas descargadas | cobertura real: %s -> %s | duplicados=%d | huecos>%sh=%d",
+                tf, diag["n_candles"], diag["first_time"], diag["last_time"],
+                diag["duplicate_timestamps"], GAP_THRESHOLD_HOURS, len(diag["gaps"]),
+            )
             dataframes[tf] = df
 
         actual_days = (dataframes["M1"]["time"].max() - dataframes["M1"]["time"].min()).days
@@ -241,6 +352,18 @@ def run_backtest(months: int, symbol: str) -> None:
             "Cobertura real de M1: %d dias (%d velas) — solicitados %d meses (~%d dias)",
             actual_days, len(dataframes["M1"]), months, months * 30,
         )
+
+    conn = database.init_db(db_path)
+
+    try:
+        alignment_diagnostics = [_check_timeframe_alignment(dataframes[tf], tf) for tf in config.ALL_TIMEFRAMES]
+        for a in alignment_diagnostics:
+            if a["misaligned_count"] > 0:
+                logger.warning("%s: %d velas mal alineadas (ejemplos: %s)", a["timeframe"], a["misaligned_count"], a["examples"])
+
+        tz_diagnostics = _check_tz_consistency(dataframes)
+        if not tz_diagnostics["consistent"]:
+            logger.warning("Zona horaria INCONSISTENTE entre timeframes: %s", tz_diagnostics["tz_by_timeframe"])
 
         logger.info("Calculando linea de tiempo de bias (M15/H1)...")
         bias_timeline = smc_engine.compute_bias_timeline(dataframes["M15"], dataframes["H1"])
@@ -295,21 +418,29 @@ def run_backtest(months: int, symbol: str) -> None:
                 w["m1_data_present_days"], w["days"], w["bias_direction_counts"],
             )
 
-        diagnostics_path = Path(config.DB_PATH).parent / "backtest_diagnostics.txt"
         _write_diagnostics_report(
             diagnostics_path, symbol, date_from, date_to, offset_hours,
-            ohlc_diagnostics, gap_windows, stats, by_type_conf,
+            ohlc_diagnostics, alignment_diagnostics, tz_diagnostics, gap_windows,
+            stats, by_type_conf, dry_run=dry_run,
         )
+
+        if dry_run:
+            logger.info(
+                "DRY-RUN completo. DB de prueba: %s | diagnostico: %s. "
+                "Esto NO es un backtest real -- corre sin --dry-run contra MT5 para eso.",
+                db_path, diagnostics_path,
+            )
 
     finally:
         conn.close()
-        client.disconnect()
+        if client is not None:
+            client.disconnect()
 
 
 def main() -> None:
     setup_logging()
     args = parse_args()
-    run_backtest(months=args.months, symbol=args.symbol)
+    run_backtest(months=args.months, symbol=args.symbol, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
