@@ -4,3 +4,6 @@ numpy>=1.24
 smartmoneyconcepts>=0.0.24
 python-dotenv>=1.0
 pytest>=7.4
+
+# Fase 3 -- notificador de Telegram (telegram_notifier.py), independiente de lo anterior
+requests>=2.31

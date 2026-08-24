@@ -107,7 +107,11 @@ smc_engine.py     Wrapper sobre smartmoneyconcepts. Puro: DataFrame -> BiasResul
 database.py       Esquema SQLite + insercion/consulta idempotente.
 main.py           Bucle en vivo (produccion).
 backtest.py       Motor SMC sobre historico de MT5, sin conexion en vivo.
-tests/            Pruebas de sanity de smc_engine.py y database.py con datos sinteticos.
+tests/            Pruebas de sanity con datos sinteticos.
+
+# Fase 3 -- notificador de Telegram, independiente de todo lo anterior (ver seccion propia mas abajo)
+telegram_config.py    Parametros del notificador (token, chat_id, rutas de log).
+telegram_notifier.py  Cliente minimo de la Bot API + format_signal_message(). SOLO infraestructura, sin conexion a signals.
 ```
 
 ## 1. Instalar el terminal MT5 y abrir una cuenta demo
@@ -262,13 +266,121 @@ re-correr el backtest sobre la misma ventana no genera duplicados.
   `backtest_diagnostics.txt`; ajustalo mentalmente (o corrigelo en el
   analisis) si necesitas horas exactas en UTC real.
 
+## Fase 3 — Notificador de Telegram (infraestructura, aislada)
+
+`telegram_notifier.py` es un modulo **totalmente independiente** de todo lo
+de arriba: no importa `smc_engine.py`, `database.py`, `config.py` ni
+`mt5_client.py` de la Fase 1, ni `macro_engine.py` de la Fase 2. Hoy solo
+sabe formatear un mensaje a partir de un dict de ejemplo (con la misma
+forma que una fila de la tabla `signals`) y enviarlo a un chat de Telegram.
+Conectarlo a una senal real de verdad es trabajo de una fase posterior.
+
+Se eligio hacer la llamada HTTP directa con `requests` en vez de la
+libreria `python-telegram-bot`: la libreria oficial (v20+) es asincrona
+(asyncio) y trae mucha mas superficie de la que hace falta para "mandar un
+mensaje de texto a un chat_id fijo". Una peticion POST al endpoint
+`sendMessage` es mas simple de mantener para este caso de uso minimo.
+
+### 1. Crear el bot con @BotFather y sacar el token
+
+1. En Telegram, busca **@BotFather** (el bot oficial de Telegram para crear
+   bots) y abrele un chat.
+2. Envia `/newbot` y sigue las instrucciones: te pide un nombre para
+   mostrar y un username (tiene que terminar en `bot`, ej. `MiOroBot`).
+3. BotFather te devuelve un token con forma
+   `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` — esa es tu
+   `TELEGRAM_BOT_TOKEN`. Guardalo, no lo compartas (con el token cualquiera
+   puede mandar mensajes como tu bot).
+
+### 2. Sacar tu chat_id
+
+El chat_id NO es tu username de Telegram, es un numero. Dos formas simples:
+
+**Opcion A — a mano, con el propio bot:**
+1. Busca tu bot por su username (el que le diste a BotFather) y envíale
+   cualquier mensaje (ej. "hola").
+2. En el navegador, abre:
+   `https://api.telegram.org/bot<TU_TOKEN>/getUpdates`
+   (reemplaza `<TU_TOKEN>` por tu token real).
+3. En el JSON que devuelve, busca `"chat":{"id":...}` — ese numero es tu
+   `TELEGRAM_CHAT_ID`. Si el JSON viene vacio (`"result":[]`), es que el
+   mensaje del paso 1 no llego todavia o el bot no lo vio; reenvialo y
+   recarga.
+
+**Opcion B — con un bot de terceros:** busca **@userinfobot** en Telegram,
+abrele un chat, y te contesta con tu `id` directamente (ese bot es de
+terceros, no de Telegram; usalo solo para sacar el numero, no le des el
+token de tu propio bot).
+
+Si vas a mandar mensajes a un **grupo** en vez de a tu chat personal, el
+chat_id de un grupo es un numero negativo; anade el bot al grupo primero y
+repite la Opcion A (el `getUpdates` mostrara el id del grupo).
+
+### 3. Configurar `.env`
+
+```
+TELEGRAM_BOT_TOKEN=123456789:tu_token_de_botfather
+TELEGRAM_CHAT_ID=tu_chat_id
+```
+
+### 4. Probar que la conexion funciona
+
+```bash
+python telegram_notifier.py --test-message
+```
+
+Formatea y envia un mensaje de ejemplo (datos ficticios, no una senal real)
+al chat configurado. Si todo esta bien, deberias ver el mensaje en Telegram
+en un par de segundos e imprime `[OK]`; si falla, imprime `[FALLO]` con
+el motivo (credenciales faltantes, token invalido, sin red, etc.) y termina
+con codigo de salida distinto de cero — util para detectarlo en un script.
+
+El mensaje de ejemplo se ve asi (texto plano, sin HTML ni Markdown, pensado
+para leerse de un vistazo en el movil):
+```
+XAUUSD | FVG bullish | M1
+Bias: bullish (H1) -> CONFLUENTE
+Precio: 2015.230
+Zona: 2014.800 - 2015.100
+```
+
+### Manejo de errores
+
+`TelegramNotifier.send_message()` nunca lanza una excepcion: si falta el
+token/chat_id, si Telegram responde con un error HTTP, si la respuesta no
+es JSON valido, o si hay un fallo de red, lo registra en
+`logs/telegram.log` con el motivo exacto y devuelve `False`. Mismo criterio
+de aislamiento que las 4 fuentes de `macro_engine.py` en la Fase 2: un
+fallo de Telegram no debe tumbar nada mas del proceso que lo llama.
+
+`format_signal_message()` tampoco lanza: un campo faltante muestra `N/D` o
+`?` segun corresponda, y un `trigger_type` que no reconoce (distinto de
+`fvg`/`order_block`/`liquidity_sweep`) cae a una version legible del valor
+crudo en vez de romper — pensado para el dia que esto reciba filas reales
+de `signals`, que pueden venir incompletas o con un tipo de trigger nuevo.
+
+### Sin verificar en vivo
+
+Este modulo se desarrollo en un entorno sin acceso de red a
+`api.telegram.org` (proxy de salida bloqueado, confirmado al correr
+`--test-message` con credenciales de prueba: el error de red se captura
+correctamente, pero nunca se llego a confirmar un envio real exitoso).
+Antes de confiar en el, corre `python telegram_notifier.py --test-message`
+en una maquina con acceso a internet, con tu propio `TELEGRAM_BOT_TOKEN` y
+`TELEGRAM_CHAT_ID` reales, y confirma que el mensaje de prueba llega a tu
+Telegram.
+
 ## Correr las pruebas
 
 ```bash
 pytest tests/ -v
 ```
 
-Las pruebas usan datos OHLC **sinteticos** (random walk generado con semilla
-fija, mas variantes con huecos de precio y velas planas) para comprobar que
-`smc_engine.py` no rompe con datos raros. No sustituyen al backtest contra
-historico real.
+Las pruebas de Fase 1 usan datos OHLC **sinteticos** (random walk generado
+con semilla fija, mas variantes con huecos de precio y velas planas) para
+comprobar que `smc_engine.py` no rompe con datos raros; no sustituyen al
+backtest contra historico real. Las pruebas de Fase 3
+(`tests/test_telegram_notifier.py`) prueban `format_signal_message()` con
+datos incompletos/inesperados y `TelegramNotifier.send_message()` con
+`requests.post` mockeado, sin tocar la red; no sustituyen a
+`python telegram_notifier.py --test-message`.
