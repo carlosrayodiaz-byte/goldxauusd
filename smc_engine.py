@@ -22,6 +22,18 @@ Notas de causalidad (importante para el backtest, ver README):
   backtest puede adelantar en unas pocas velas el bias comparado en la
   confluencia. Si el analisis posterior muestra que esto distorsiona las
   estadisticas de confluencia para order_block, revisar en una fase futura.
+
+Hallazgo de auditoria (no corregido, limitacion de la libreria upstream):
+`smc.ob()` guarda bloques bullish y bearish en el MISMO array indexado por
+posicion de vela (dos pasadas separadas, primero todos los bullish y luego
+todos los bearish, sobre el mismo `ob[]`). Si un OB bullish y uno bearish
+eligen la misma vela de origen como `obIndex` (candidatos independientes,
+puede pasar), el segundo pisa al primero en el array ANTES de que este
+modulo lo vea -- se pierde en silencio, sin excepcion ni fila duplicada que
+detectar. No es corregible sin reimplementar la deteccion de OB de la
+libreria; queda documentado como riesgo conocido de sub-conteo de
+order_block, mas relevante en ventanas largas (backtest) que en el rolling
+window de 500 velas del live.
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional

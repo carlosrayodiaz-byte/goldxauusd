@@ -7,6 +7,17 @@ natural una deteccion concreta (mismo simbolo, mismo origen live/backtest,
 mismo timeframe/tipo/direccion de trigger, misma vela y mismos limites de
 precio). Reiniciar el bot y volver a procesar la misma ventana de velas no
 genera duplicados: se usa INSERT OR IGNORE.
+
+Hallazgo de auditoria (riesgo real pero de baja probabilidad, no corregido):
+para `liquidity_sweep`, `bottom` siempre es NULL y `top` es el promedio
+flotante de los niveles agrupados en el pool. Dos pools DISTINTOS (origen en
+velas distintas), misma direccion y mismo timeframe, barridos por la MISMA
+vela, colisionarian en el UNIQUE si sus niveles promedio redondean al mismo
+float -- posible con la precision de precio limitada de XAUUSD, aunque poco
+frecuente. `INSERT OR IGNORE` descartaria uno de los dos en silencio. No se
+corrige aqui (requeriria una columna extra para desambiguar, ej. la posicion
+de origen del pool); documentado para decidir en una fase futura si vale la
+pena el cambio de esquema.
 """
 import logging
 import sqlite3

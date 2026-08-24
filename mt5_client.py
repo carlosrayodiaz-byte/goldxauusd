@@ -15,6 +15,28 @@ import config
 logger = logging.getLogger(__name__)
 
 TIMEFRAME_NAMES = ["M1", "M5", "M15", "H1"]
+_TIMEFRAME_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}
+
+
+def _trim_unclosed_candle(df: pd.DataFrame, timeframe_key: str, now: Optional[datetime] = None) -> pd.DataFrame:
+    """Descarta la ultima vela si todavia no pudo haber cerrado a esta hora.
+
+    `copy_rates_range` (a diferencia de `copy_rates_from_pos` con start_pos=1,
+    que ya excluye la vela en formacion) NO excluye automaticamente la vela
+    en curso: si `date_to` cae a mitad de esa vela -- el caso normal al pedir
+    historico "hasta ahora", como hace backtest.py -- su open time igual
+    cae dentro del rango pedido y queda incluida con datos que todavia
+    pueden cambiar. Sin este recorte, un patron (BOS/CHoCH/FVG/OB/liquidity)
+    podria "confirmarse" usando una vela que en tiempo real aun no cerro:
+    exactamente el look-ahead que main.py evita con start_pos=1."""
+    if df.empty:
+        return df
+    now = now or datetime.now(timezone.utc)
+    close_deadline = df["time"] + pd.Timedelta(minutes=_TIMEFRAME_MINUTES[timeframe_key])
+    still_forming = close_deadline > now
+    if not still_forming.any():
+        return df
+    return df[~still_forming].reset_index(drop=True)
 
 
 def _timeframe_map():
@@ -190,4 +212,5 @@ class MT5Client:
 
         df = pd.concat(chunks, ignore_index=True)
         df = df.drop_duplicates(subset="time").sort_values("time").reset_index(drop=True)
+        df = _trim_unclosed_candle(df, timeframe_key)
         return df
