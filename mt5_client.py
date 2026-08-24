@@ -5,7 +5,7 @@ maquina, y descarga de velas OHLC. No se usa ninguna funcion de trading
 """
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -97,6 +97,24 @@ class MT5Client:
                 time.sleep(config.MT5_RECONNECT_DELAY_SECONDS)
         raise MT5ConnectionError(f"No se pudo reconectar a MT5 tras {config.MT5_RECONNECT_RETRIES} intentos") from last_exc
 
+    def estimate_server_offset_hours(self, symbol: str) -> Optional[float]:
+        """Estima el desfase (en horas) entre el reloj del servidor del
+        broker y UTC real, comparando el timestamp del ultimo tick recibido
+        contra la hora UTC del sistema. IMPORTANTE: MT5 devuelve los
+        timestamps de velas/ticks en la hora del SERVIDOR del broker, no en
+        UTC real; `_rates_to_df` los etiqueta igualmente como UTC (limitacion
+        conocida, ver README) porque no hay forma de obtener el offset real
+        via la API salvo esta estimacion aproximada (+/- 1 min de margen de
+        error por la latencia del ultimo tick)."""
+        self.ensure_connected()
+        mt5 = self._mt5
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or not tick.time:
+            return None
+        server_time = datetime.fromtimestamp(tick.time, tz=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (server_time - now).total_seconds() / 3600.0
+
     def disconnect(self) -> None:
         if self._mt5 is not None:
             self._mt5.shutdown()
@@ -136,17 +154,40 @@ class MT5Client:
         return self._rates_to_df(rates)
 
     def get_ohlc_range(
-        self, symbol: str, timeframe_key: str, date_from: datetime, date_to: datetime
+        self, symbol: str, timeframe_key: str, date_from: datetime, date_to: datetime,
+        chunk_days: int = 7,
     ) -> pd.DataFrame:
-        """Velas historicas de `symbol` entre dos fechas (UTC). Uso en backtest."""
+        """Velas historicas de `symbol` entre dos fechas (UTC). Uso en backtest.
+
+        Se pide en bloques de `chunk_days` en vez de todo el rango de una vez:
+        muchos terminales MT5 limitan el "maximo de barras en el grafico"
+        (comunmente 100000, a veces menos segun la config del terminal),
+        y copy_rates_range no avisa si trunca silenciosamente un rango grande
+        (ej. 3 meses de M1 son ~90000+ velas). Pedir por semanas evita ese
+        limite independientemente de como este configurado el terminal."""
         self.ensure_connected()
         mt5 = self._mt5
         tf = _timeframe_map()[timeframe_key]
 
-        rates = mt5.copy_rates_range(symbol, tf, date_from, date_to)
-        if rates is None:
-            code, desc = mt5.last_error()
-            raise MT5ConnectionError(
-                f"copy_rates_range fallo para {symbol}/{timeframe_key} (codigo {code}): {desc}"
-            )
-        return self._rates_to_df(rates)
+        chunks = []
+        chunk_start = date_from
+        step = timedelta(days=chunk_days)
+        while chunk_start < date_to:
+            chunk_end = min(chunk_start + step, date_to)
+            rates = mt5.copy_rates_range(symbol, tf, chunk_start, chunk_end)
+            if rates is None:
+                code, desc = mt5.last_error()
+                raise MT5ConnectionError(
+                    f"copy_rates_range fallo para {symbol}/{timeframe_key} "
+                    f"[{chunk_start} -> {chunk_end}] (codigo {code}): {desc}"
+                )
+            if len(rates) > 0:
+                chunks.append(self._rates_to_df(rates))
+            chunk_start = chunk_end
+
+        if not chunks:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+        df = pd.concat(chunks, ignore_index=True)
+        df = df.drop_duplicates(subset="time").sort_values("time").reset_index(drop=True)
+        return df

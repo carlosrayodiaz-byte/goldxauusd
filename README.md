@@ -83,13 +83,27 @@ funciona bien contra datos reales:
 python backtest.py --months 3
 ```
 
-Esto descarga ~3 meses de M1/M5/M15/H1 del simbolo configurado, calcula la
-misma logica de bias/triggers que usaria en vivo (sin fuga de informacion
-futura, ver "Metodologia" en `backtest.py`), y guarda todo en
-`data/signals.db` con `source="backtest"`. Al final imprime un resumen por
-tipo de trigger y confluencia. Revisa la base de datos (con cualquier cliente
-SQLite, ej. `DB Browser for SQLite`) para inspeccionar las senales antes de
-confiar en el motor.
+Esto descarga ~3 meses de M1/M5/M15/H1 del simbolo configurado (en bloques
+semanales, para no toparse con el limite de "maximo de barras en el grafico"
+del terminal), calcula la misma logica de bias/triggers que usaria en vivo
+(sin fuga de informacion futura, ver "Metodologia" en `backtest.py`), y
+guarda todo en `data/signals.db` con `source="backtest"`. Al final imprime un
+resumen por tipo de trigger y confluencia.
+
+Ademas escribe `data/backtest_diagnostics.txt` con lo que no cabe en la
+tabla `signals`:
+- Cobertura real de datos por timeframe (primera/ultima vela, cuantas velas
+  llegaron realmente — util si el broker no tiene los 3 meses completos).
+- Timestamps duplicados y huecos de tiempo (>4h) en las velas descargadas
+  (fines de semana normales, o caidas de feed del broker).
+- El offset estimado entre el reloj del servidor del broker y UTC real (ver
+  limitacion de zona horaria mas abajo).
+- Ventanas de 2+ dias seguidos sin ninguna senal generada (M1+M5), con
+  contexto de si hubo datos M1 ese dia y que bias predomino.
+
+Revisa `data/backtest_diagnostics.txt` y la base de datos (con cualquier
+cliente SQLite, ej. `DB Browser for SQLite`, o `sqlite3 data/signals.db`)
+para inspeccionar las senales antes de confiar en el motor.
 
 ## 5. Correr en vivo: `main.py`
 
@@ -139,6 +153,18 @@ re-correr el backtest sobre la misma ventana no genera duplicados.
   `order_block` durante el backtest. Ver docstring de `smc_engine.py`.
 - No hay gestion de riesgo, position sizing, ni conexion de escritura a la
   cuenta: el login a MT5 es solo de lectura de mercado.
+- **Zona horaria**: MT5 devuelve los timestamps de velas en la hora del
+  *servidor del broker*, no en UTC real. `mt5_client.py` los etiqueta como
+  UTC (`pd.to_datetime(..., utc=True)`) porque es la convencion mas simple
+  para que toda la logica interna (comparaciones, `merge_asof`, dedup por
+  `candle_time`) sea consistente entre timeframes — y lo es, porque todos los
+  timeframes vienen del mismo reloj de servidor. Pero la hora "UTC" que ves
+  en la base de datos puede estar desplazada respecto a UTC real (tipicamente
+  0 a 3 horas, segun el broker, y a veces con un salto extra por DST que no
+  coincide con el DST de tu zona). `backtest.py` estima ese offset
+  comparando el ultimo tick contra la hora del sistema y lo reporta en
+  `backtest_diagnostics.txt`; ajustalo mentalmente (o corrigelo en el
+  analisis) si necesitas horas exactas en UTC real.
 
 ## Correr las pruebas
 
