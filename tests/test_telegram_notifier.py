@@ -236,3 +236,178 @@ class TestCli:
     def test_no_args_prints_help_and_exits_zero(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["telegram_notifier.py"])
         assert telegram_notifier.main() == 0
+
+
+# ---------------------------------------------------------------------------
+# Auditoria: manejo de HTTP 429 (rate limit) y throttling del lado del
+# cliente. time.sleep/time.monotonic mockeados para no ralentizar los tests.
+# ---------------------------------------------------------------------------
+
+def _sequence_post(responses):
+    """requests.post falso que devuelve una respuesta distinta por llamada,
+    en orden, y cuenta cuantas veces se llamo."""
+    calls = {"n": 0}
+
+    def fake_post(*args, **kwargs):
+        r = responses[calls["n"]]
+        calls["n"] += 1
+        return r
+
+    return fake_post, calls
+
+
+class TestRetryAfter429:
+    def test_extract_retry_after_reads_body_field(self):
+        resp = _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 7}})
+        assert telegram_notifier._extract_retry_after(resp) == 7.0
+
+    def test_extract_retry_after_falls_back_when_missing(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "DEFAULT_RETRY_AFTER_SECONDS", 2.5)
+        resp = _FakeResponse(status_code=429, payload={"ok": False})
+        assert telegram_notifier._extract_retry_after(resp) == 2.5
+
+    def test_429_then_200_retries_once_and_succeeds(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: None)
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: 0.0)
+
+        responses = [
+            _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 3}}),
+            _FakeResponse(),  # 200 OK en el reintento
+        ]
+        fake_post, calls = _sequence_post(responses)
+        monkeypatch.setattr(telegram_notifier.requests, "post", fake_post)
+
+        notifier = TelegramNotifier()
+        assert notifier.send_message("hola") is True
+        assert calls["n"] == 2
+
+    def test_429_then_429_fails_after_single_retry_no_loop(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: None)
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: 0.0)
+
+        responses = [
+            _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 2}}),
+            _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 2}}),
+        ]
+        fake_post, calls = _sequence_post(responses)
+        monkeypatch.setattr(telegram_notifier.requests, "post", fake_post)
+
+        notifier = TelegramNotifier()
+        assert notifier.send_message("hola") is False
+        assert calls["n"] == 2  # exactamente 2 intentos, nunca mas
+
+    def test_429_retry_sleeps_for_retry_after_value(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: 0.0)
+        sleep_calls = []
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: sleep_calls.append(s))
+
+        responses = [
+            _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 5}}),
+            _FakeResponse(),
+        ]
+        fake_post, _ = _sequence_post(responses)
+        monkeypatch.setattr(telegram_notifier.requests, "post", fake_post)
+
+        TelegramNotifier().send_message("hola")
+        assert 5.0 in sleep_calls
+
+    def test_network_error_on_retry_returns_false(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: None)
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: 0.0)
+
+        calls = {"n": 0}
+
+        def fake_post(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FakeResponse(status_code=429, payload={"ok": False, "parameters": {"retry_after": 1}})
+            raise telegram_notifier.requests.ConnectionError("caida en el reintento")
+
+        monkeypatch.setattr(telegram_notifier.requests, "post", fake_post)
+
+        notifier = TelegramNotifier()
+        assert notifier.send_message("hola") is False
+        assert calls["n"] == 2
+
+
+class TestClientSideThrottle:
+    def test_second_call_waits_remaining_time(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_config, "MIN_SECONDS_BETWEEN_MESSAGES", 1.0)
+        monkeypatch.setattr(telegram_notifier.requests, "post", lambda *a, **k: _FakeResponse())
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: clock["t"])
+
+        sleep_calls = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            clock["t"] += seconds  # simula que el tiempo avanza mientras "duerme"
+
+        monkeypatch.setattr(telegram_notifier.time, "sleep", fake_sleep)
+
+        notifier = TelegramNotifier()
+        notifier.send_message("uno")
+
+        clock["t"] += 0.1  # la siguiente llamada ocurre 0.1s despues
+        notifier.send_message("dos")
+
+        assert sleep_calls == [pytest.approx(0.9)]
+
+    def test_no_wait_if_enough_time_already_passed(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_config, "MIN_SECONDS_BETWEEN_MESSAGES", 1.0)
+        monkeypatch.setattr(telegram_notifier.requests, "post", lambda *a, **k: _FakeResponse())
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: clock["t"])
+        sleep_calls = []
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: sleep_calls.append(s))
+
+        notifier = TelegramNotifier()
+        notifier.send_message("uno")
+
+        clock["t"] += 2.0  # bastante mas que MIN_SECONDS_BETWEEN_MESSAGES
+        notifier.send_message("dos")
+
+        assert sleep_calls == []
+
+    def test_first_call_never_throttles(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_notifier.requests, "post", lambda *a, **k: _FakeResponse())
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: 1000.0)
+        sleep_calls = []
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: sleep_calls.append(s))
+
+        notifier = TelegramNotifier()
+        notifier.send_message("uno")
+        assert sleep_calls == []
+
+    def test_throttle_applies_across_multiple_signal_sends(self, monkeypatch):
+        monkeypatch.setattr(telegram_config, "TELEGRAM_BOT_TOKEN", "dummy-token")
+        monkeypatch.setattr(telegram_config, "TELEGRAM_CHAT_ID", "12345")
+        monkeypatch.setattr(telegram_config, "MIN_SECONDS_BETWEEN_MESSAGES", 1.0)
+        monkeypatch.setattr(telegram_notifier.requests, "post", lambda *a, **k: _FakeResponse())
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(telegram_notifier.time, "monotonic", lambda: clock["t"])
+        sleep_calls = []
+        monkeypatch.setattr(telegram_notifier.time, "sleep", lambda s: sleep_calls.append(s))
+
+        notifier = TelegramNotifier()
+        notifier.send_signal_message(EXAMPLE_SIGNAL)
+        notifier.send_signal_message(EXAMPLE_SIGNAL)  # mismo instante simulado -> deberia esperar ~1s
+
+        assert sleep_calls == [pytest.approx(1.0)]

@@ -19,6 +19,7 @@ Uso:
 """
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -104,12 +105,52 @@ def format_signal_message(signal: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _extract_retry_after(resp: requests.Response) -> float:
+    """Lee `parameters.retry_after` del body de un 429 de Telegram. Si no
+    esta presente (o el body no es JSON valido), usa el fallback de
+    config en vez de fallar el parseo."""
+    try:
+        payload = resp.json()
+        retry_after = payload.get("parameters", {}).get("retry_after")
+        if retry_after is not None:
+            return float(retry_after)
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return cfg.DEFAULT_RETRY_AFTER_SECONDS
+
+
 class TelegramNotifier:
-    """Cliente minimo sobre la Bot API de Telegram (solo sendMessage)."""
+    """Cliente minimo sobre la Bot API de Telegram (solo sendMessage).
+
+    Dos capas de rate limiting (Telegram permite ~1 msg/seg por chat_id):
+    - Throttling del lado del cliente: `_throttle()` espera antes de cada
+      envio si el anterior fue hace menos de MIN_SECONDS_BETWEEN_MESSAGES.
+    - Reactivo: si aun asi Telegram devuelve HTTP 429, se lee `retry_after`
+      del body, se espera ese tiempo, y se reintenta UNA sola vez -- si el
+      segundo intento tambien falla (429 u otro error), se registra y se
+      devuelve False como con cualquier otro fallo, sin bucle."""
 
     def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
         self.bot_token = bot_token or cfg.TELEGRAM_BOT_TOKEN
         self.chat_id = chat_id or cfg.TELEGRAM_CHAT_ID
+        self._last_send_at: Optional[float] = None
+
+    def _throttle(self) -> None:
+        if self._last_send_at is None:
+            return
+        wait = cfg.MIN_SECONDS_BETWEEN_MESSAGES - (time.monotonic() - self._last_send_at)
+        if wait > 0:
+            logger.debug("telegram: throttling %.2fs antes del siguiente envio", wait)
+            time.sleep(wait)
+
+    def _post(self, text: str) -> requests.Response:
+        resp = requests.post(
+            f"{cfg.TELEGRAM_API_BASE}{self.bot_token}/sendMessage",
+            data={"chat_id": self.chat_id, "text": text},
+            timeout=cfg.HTTP_TIMEOUT_SECONDS,
+        )
+        self._last_send_at = time.monotonic()
+        return resp
 
     def send_message(self, text: str) -> bool:
         """Envia `text` al chat configurado. Nunca lanza: si Telegram no
@@ -120,32 +161,41 @@ class TelegramNotifier:
             logger.error("telegram: falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID (ver .env.example / README)")
             return False
 
-        url = f"{cfg.TELEGRAM_API_BASE}{self.bot_token}/sendMessage"
-        try:
-            resp = requests.post(
-                url, data={"chat_id": self.chat_id, "text": text}, timeout=cfg.HTTP_TIMEOUT_SECONDS
-            )
-        except requests.RequestException as exc:
-            logger.error("telegram: fallo de red enviando el mensaje: %s", exc)
-            return False
+        for attempt in (1, 2):
+            self._throttle()
+            try:
+                resp = self._post(text)
+            except requests.RequestException as exc:
+                logger.error("telegram: fallo de red enviando el mensaje: %s", exc)
+                return False
 
-        if resp.status_code != 200:
-            logger.error("telegram: la API devolvio HTTP %d: %s", resp.status_code, resp.text[:300])
-            return False
+            if resp.status_code == 429 and attempt == 1:
+                retry_after = _extract_retry_after(resp)
+                logger.warning(
+                    "telegram: HTTP 429 (rate limit), esperando %.1fs y reintentando una vez", retry_after
+                )
+                time.sleep(retry_after)
+                continue  # segundo y ultimo intento
 
-        try:
-            payload = resp.json()
-        except ValueError:
-            logger.error("telegram: respuesta no-JSON de la API: %s", resp.text[:300])
-            return False
+            if resp.status_code != 200:
+                logger.error("telegram: la API devolvio HTTP %d: %s", resp.status_code, resp.text[:300])
+                return False
 
-        if not payload.get("ok"):
-            logger.error("telegram: respuesta no-ok de la API: %s", payload)
-            return False
+            try:
+                payload = resp.json()
+            except ValueError:
+                logger.error("telegram: respuesta no-JSON de la API: %s", resp.text[:300])
+                return False
 
-        message_id = payload.get("result", {}).get("message_id")
-        logger.info("telegram: mensaje enviado (message_id=%s)", message_id)
-        return True
+            if not payload.get("ok"):
+                logger.error("telegram: respuesta no-ok de la API: %s", payload)
+                return False
+
+            message_id = payload.get("result", {}).get("message_id")
+            logger.info("telegram: mensaje enviado (message_id=%s)", message_id)
+            return True
+
+        return False  # inalcanzable (el segundo intento siempre retorna arriba), por claridad
 
     def send_signal_message(self, signal: Dict[str, Any]) -> bool:
         """Formatea y envia un dict con forma de fila de `signals`."""
