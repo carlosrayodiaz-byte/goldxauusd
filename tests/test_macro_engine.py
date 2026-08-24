@@ -8,6 +8,7 @@ las funciones que hacen la llamada HTTP real. No sustituyen a
 import json
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import pytest
 
 import macro_config
@@ -352,3 +353,106 @@ class TestCollectAll:
         assert results["dxy"]["ok"] is True
         assert results["cot_gold"]["ok"] is True
         assert results["econ_calendar"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Auditoria: un DXY corrupto (200 OK pero fuera de rango plausible) debe
+# rechazarse en el camino REAL de fetch (_fetch_dxy_yfinance / parse_stooq_csv),
+# no solo en sanity_check_dxy.
+# ---------------------------------------------------------------------------
+
+class _FakeYfTicker:
+    def __init__(self, hist_df):
+        self._hist_df = hist_df
+
+    def history(self, period=None, interval=None):
+        return self._hist_df
+
+
+def _make_yf_hist(close_value, date="2024-01-02"):
+    idx = pd.DatetimeIndex([pd.Timestamp(date, tz="America/New_York")])
+    return pd.DataFrame({"Close": [close_value]}, index=idx)
+
+
+class TestDxyPlausibilityValidation:
+    def test_is_plausible_dxy_boundaries(self):
+        assert macro_engine._is_plausible_dxy(70.0) is False  # limites exclusivos
+        assert macro_engine._is_plausible_dxy(130.0) is False
+        assert macro_engine._is_plausible_dxy(100.0) is True
+
+    @pytest.mark.parametrize("bad_close", [0.0, -5.0, 500.0])
+    def test_yfinance_corrupt_value_returns_none_not_raise(self, bad_close, monkeypatch):
+        import yfinance
+        monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeYfTicker(_make_yf_hist(bad_close)))
+        assert macro_engine._fetch_dxy_yfinance() is None
+
+    def test_yfinance_valid_value_still_returns_snapshot(self, monkeypatch):
+        import yfinance
+        monkeypatch.setattr(yfinance, "Ticker", lambda ticker: _FakeYfTicker(_make_yf_hist(103.456)))
+        snap = macro_engine._fetch_dxy_yfinance()
+        assert snap is not None
+        assert snap.close == pytest.approx(103.456)
+        assert snap.source == "yfinance"
+
+    @pytest.mark.parametrize("bad_close", [0.0, -5.0, 500.0])
+    def test_stooq_corrupt_value_returns_none_not_raise(self, bad_close):
+        text = f"Date,Open,High,Low,Close,Volume\n2024-01-02,100,101,99,{bad_close},0\n"
+        assert macro_engine.parse_stooq_csv(text) is None
+
+    def test_stooq_valid_value_still_returns_snapshot(self):
+        text = "Date,Open,High,Low,Close,Volume\n2024-01-02,100,101,99,103.456,0\n"
+        snap = macro_engine.parse_stooq_csv(text)
+        assert snap is not None
+        assert snap.close == pytest.approx(103.456)
+        assert snap.source == "stooq"
+
+    def test_fetch_dxy_falls_back_to_stooq_when_yfinance_value_is_corrupt(self, tmp_path, monkeypatch):
+        # _fetch_dxy_yfinance ya habria devuelto None por el valor corrupto;
+        # aqui se prueba que fetch_dxy() reacciona igual que ante un fallo de red.
+        monkeypatch.setattr(macro_config, "MACRO_DB_PATH", str(tmp_path / "macro.db"))
+        monkeypatch.setattr(macro_engine, "_fetch_dxy_yfinance", lambda: None)
+        monkeypatch.setattr(
+            macro_engine, "_fetch_dxy_stooq",
+            lambda: macro_engine.DxySnapshot(date="2024-01-02", close=103.2, source="stooq"),
+        )
+        snap = macro_engine.fetch_dxy(use_cache=False)
+        assert snap.source == "stooq"
+
+    def test_fetch_dxy_raises_when_both_sources_corrupt(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(macro_config, "MACRO_DB_PATH", str(tmp_path / "macro.db"))
+        monkeypatch.setattr(macro_engine, "_fetch_dxy_yfinance", lambda: None)
+        monkeypatch.setattr(macro_engine, "_fetch_dxy_stooq", lambda: None)
+        with pytest.raises(MacroDataError):
+            macro_engine.fetch_dxy(use_cache=False)
+
+    def test_collect_all_isolates_corrupt_dxy_from_other_sources(self, tmp_path, monkeypatch):
+        # Un DXY corrupto (ambas fuentes fallan la validacion) no debe tumbar
+        # collect_all() ni las otras 3 fuentes -- mismo criterio de aislamiento
+        # que un fallo de red.
+        monkeypatch.setattr(macro_config, "MACRO_DB_PATH", str(tmp_path / "macro.db"))
+        monkeypatch.setattr(macro_engine, "_fetch_dxy_yfinance", lambda: None)
+        monkeypatch.setattr(macro_engine, "_fetch_dxy_stooq", lambda: None)
+        monkeypatch.setattr(
+            macro_engine, "fetch_real_yields",
+            lambda use_cache: macro_engine.RealYieldSnapshot(date="2024-01-02", dfii10=1.8, dgs10=4.1),
+        )
+        monkeypatch.setattr(
+            macro_engine, "fetch_cot_gold",
+            lambda use_cache: macro_engine.CotSnapshot("2024-01-02", 10, 5, 5, 80.0, 100, None),
+        )
+        monkeypatch.setattr(macro_engine, "fetch_economic_calendar", lambda use_cache: [])
+
+        results = macro_engine.collect_all(use_cache=True)
+
+        assert results["dxy"]["ok"] is False
+        assert results["real_yields"]["ok"] is True
+        assert results["cot_gold"]["ok"] is True
+        assert results["econ_calendar"]["ok"] is True
+
+    def test_sanity_check_dxy_uses_shared_validator(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(macro_config, "MACRO_DB_PATH", str(tmp_path / "macro.db"))
+        monkeypatch.setattr(
+            macro_engine, "fetch_dxy",
+            lambda use_cache: macro_engine.DxySnapshot(date="2024-01-02", close=103.2, source="yfinance"),
+        )
+        macro_engine.sanity_check_dxy()  # no debe lanzar

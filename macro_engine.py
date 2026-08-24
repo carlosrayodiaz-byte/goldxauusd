@@ -127,6 +127,15 @@ class DxySnapshot:
     source: str  # "yfinance" | "stooq"
 
 
+def _is_plausible_dxy(close: float) -> bool:
+    """Rango plausible del DXY (ver macro_config.py). Se usa en el camino
+    real de fetch (para descartar un 200 OK con datos corruptos, ej.
+    Close=0.0 por un glitch de la API, ANTES de cachearlo o devolverlo como
+    valido) y en sanity_check_dxy() (misma constante, sin duplicar el
+    numero magico)."""
+    return cfg.DXY_PLAUSIBLE_MIN < close < cfg.DXY_PLAUSIBLE_MAX
+
+
 def _fetch_dxy_yfinance() -> Optional[DxySnapshot]:
     try:
         import yfinance as yf
@@ -146,7 +155,15 @@ def _fetch_dxy_yfinance() -> Optional[DxySnapshot]:
         return None
     last = closes.iloc[-1]
     as_of = closes.index[-1]
-    return DxySnapshot(date=as_of.strftime("%Y-%m-%d"), close=float(last["Close"]), source="yfinance")
+    close = float(last["Close"])
+    if not _is_plausible_dxy(close):
+        logger.warning(
+            "dxy: yfinance devolvio un valor fuera de rango plausible para %s: %.4f "
+            "(esperado %.0f-%.0f) -- tratado como fuente fallida, no se cachea",
+            cfg.DXY_YFINANCE_TICKER, close, cfg.DXY_PLAUSIBLE_MIN, cfg.DXY_PLAUSIBLE_MAX,
+        )
+        return None
+    return DxySnapshot(date=as_of.strftime("%Y-%m-%d"), close=close, source="yfinance")
 
 
 def parse_stooq_csv(text: str) -> Optional[DxySnapshot]:
@@ -163,6 +180,13 @@ def parse_stooq_csv(text: str) -> Optional[DxySnapshot]:
         close = float(row["Close"])
     except (KeyError, ValueError) as exc:
         raise MacroDataError(f"No se pudo parsear el cierre de stooq: {row}") from exc
+    if not _is_plausible_dxy(close):
+        logger.warning(
+            "dxy: stooq devolvio un valor fuera de rango plausible: %.4f (esperado %.0f-%.0f) "
+            "-- tratado como fuente fallida, no se cachea",
+            close, cfg.DXY_PLAUSIBLE_MIN, cfg.DXY_PLAUSIBLE_MAX,
+        )
+        return None
     return DxySnapshot(date=row["Date"], close=close, source="stooq")
 
 
@@ -445,7 +469,10 @@ def sanity_check_real_yields() -> None:
 def sanity_check_dxy() -> None:
     snap = fetch_dxy(use_cache=False)
     assert isinstance(snap.close, float), f"close deberia ser float, es {type(snap.close)}"
-    assert 70.0 < snap.close < 130.0, f"DXY={snap.close} fuera de rango plausible"
+    # Misma funcion/constantes que ya filtran en el camino real de fetch (ver
+    # _is_plausible_dxy): si esto llega a fallar aqui es que _is_plausible_dxy
+    # tiene un bug, no que el camino de fetch se salto la validacion.
+    assert _is_plausible_dxy(snap.close), f"DXY={snap.close} fuera de rango plausible"
     assert snap.source in ("yfinance", "stooq"), f"fuente inesperada: {snap.source}"
 
 

@@ -46,6 +46,14 @@ DXY_YFINANCE_TICKER = "DX-Y.NYB"
 DXY_STOOQ_SYMBOL = "dx.f"  # ICE US Dollar Index en Stooq
 DXY_STOOQ_URL = f"https://stooq.com/q/d/l/?s={DXY_STOOQ_SYMBOL}&i=d"
 
+# Rango plausible del DXY (nunca estuvo fuera de ~70-130 en su historia).
+# Un valor 200 OK pero fuera de este rango (ej. 0.0 por un glitch de la API)
+# se trata como fuente fallida, no como dato valido -- ver _is_plausible_dxy
+# en macro_engine.py, usado tanto en el camino real de fetch como en
+# sanity_check_dxy().
+DXY_PLAUSIBLE_MIN = 70.0
+DXY_PLAUSIBLE_MAX = 130.0
+
 # --- COT (CFTC Disaggregated Futures-Only, oro) ---
 # Dataset publico en el portal Socrata del CFTC, sin API key.
 CFTC_SOCRATA_BASE_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
