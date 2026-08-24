@@ -108,6 +108,11 @@ database.py       Esquema SQLite + insercion/consulta idempotente.
 main.py           Bucle en vivo (produccion).
 backtest.py       Motor SMC sobre historico de MT5, sin conexion en vivo.
 tests/            Pruebas de sanity de smc_engine.py y database.py con datos sinteticos.
+
+# Fase 2 -- capa macro, independiente de todo lo anterior (ver seccion propia mas abajo)
+macro_config.py    Parametros de la capa macro (series FRED, filtros CFTC, calendario FOMC, cache).
+macro_database.py  Cache SQLite propia (data/macro_cache.db), tabla macro_snapshots.
+macro_engine.py    Ingesta: real yields, DXY, COT oro, calendario NFP/CPI/FOMC. SOLO ingesta, sin score/bias.
 ```
 
 ## 1. Instalar el terminal MT5 y abrir una cuenta demo
@@ -262,13 +267,137 @@ re-correr el backtest sobre la misma ventana no genera duplicados.
   `backtest_diagnostics.txt`; ajustalo mentalmente (o corrigelo en el
   analisis) si necesitas horas exactas en UTC real.
 
+## Fase 2 — Capa macro (ingesta, aislada)
+
+`macro_engine.py` es un modulo **totalmente independiente** de todo lo de
+arriba: no importa `smc_engine.py` ni `database.py`, y no calcula ningun
+"score" ni bias combinado ni ventana de no-trade. Eso es trabajo de una
+fase posterior, pendiente de revisar el backtest de Fase 1. Hoy solo
+descarga, parsea, cachea y valida cuatro fuentes de datos macro, cada una
+aislada de las demas (si una API esta caida, las otras tres se siguen
+intentando igual).
+
+### Las cuatro fuentes
+
+1. **Real yields** — FRED, serie `DFII10` (TIPS a 10 anos, real yield ya
+   calculado por FRED) + `DGS10` (nominal, solo de contexto).
+2. **DXY** — `yfinance` (ticker `DX-Y.NYB`) como primera opcion. **Ojo**:
+   ese ticker especifico tiene fallos de fiabilidad documentados en Yahoo
+   Finance (HTTP 500/429 recurrentes solo en `DX-Y.NYB`, mientras otros
+   tickers funcionan bien —
+   [issue #2721 en ranaroussi/yfinance](https://github.com/ranaroussi/yfinance/issues/2721)).
+   Por eso hay un fallback automatico a [Stooq](https://stooq.com)
+   (`dx.f`, CSV publico sin API key) si yfinance falla o devuelve datos
+   vacios. Si en tu maquina yfinance funciona sin problemas, no notaras el
+   fallback; si falla, `macro_engine.py` lo hace transparente y lo deja
+   registrado en `notas`/logs de cual fuente vino cada dato.
+3. **COT (posicionamiento)** — CFTC Disaggregated Futures-Only para oro
+   (COMEX, codigo de contrato `088691`), via el dataset publico de Socrata
+   (`publicreporting.cftc.gov`, sin API key). Se calcula la posicion neta
+   de "managed money" (largos - cortos) y su percentil sobre los ultimos 3
+   anos (`>= percentil 90` o `<= percentil 10` se marca como
+   `extreme="long"`/`"short"`). El CFTC publica los viernes a las 15:30 ET,
+   con posiciones al martes anterior — el `report_date` guardado es el del
+   martes, no el del viernes de publicacion.
+4. **Calendario de alto impacto** — NFP y CPI via el calendario de
+   publicaciones de FRED (`fred/releases/dates`, `release_id=50` y `=10`
+   respectivamente), con la hora estandar de publicacion del BLS (8:30 AM
+   ET) pegada encima porque FRED solo da la fecha, no la hora. FOMC via una
+   lista estatica en `macro_config.py` (`FOMC_MEETING_DATES`): **no
+   encontramos una API gratuita con calendario forward fiable** — Trading
+   Economics exige plan de pago para el calendario de eventos futuros (su
+   "guest key" gratuito solo expone series de muestra, no el calendario).
+   La Fed publica su calendario anual de reuniones con mucha antelacion en
+   [federalreserve.gov/monetarypolicy/fomccalendars.htm](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm);
+   **las fechas en `FOMC_MEETING_DATES` no se verificaron contra esa pagina
+   en vivo** (este entorno de desarrollo no tuvo acceso de red a
+   `federalreserve.gov`) — revisalas ahi antes de confiar en ellas, y
+   actualiza la lista manualmente 1-2 veces al ano.
+
+### Configurar `.env` para la capa macro
+
+Solo hace falta una clave nueva, `FRED_API_KEY` (Stooq y el CFTC Socrata no
+requieren API key):
+
+1. Crea una cuenta gratuita en https://fredaccount.stlouisfed.org/
+2. Una vez logueado, ve a https://fredaccount.stlouisfed.org/apikeys y pulsa
+   "Request API Key" (uso no comercial, es instantaneo, no requiere
+   aprobacion manual).
+3. Copia la clave a tu `.env`:
+   ```
+   FRED_API_KEY=tu_clave_de_32_caracteres
+   ```
+
+### Cache local (`data/macro_cache.db`)
+
+Cada fuente se cachea en su propia tabla `macro_snapshots` (base de datos
+SQLite separada de `data/signals.db`, ver `macro_database.py`), con un
+tiempo de frescura distinto por fuente (`CACHE_MAX_AGE_HOURS` en
+`macro_config.py`): ~20h para real yields/DXY, ~4 dias para COT (semanal),
+~12h para el calendario. Dentro de esa ventana, `fetch_*()` no vuelve a
+golpear la API — usa lo que ya esta guardado.
+
+### Uso
+
+```bash
+# Sanity check en vivo: descarga una vez cada fuente (ignora cache) y valida
+# que la forma/rango de los datos es la esperada. Codigo de salida != 0 si
+# alguna fuente falla.
+python macro_engine.py --check
+
+# Descarga (o usa cache si esta fresca) las 4 fuentes y las guarda.
+python macro_engine.py --collect
+python macro_engine.py --collect --no-cache   # fuerza descarga fresca
+```
+
+Cada fuente falla de forma aislada: si FRED esta caido, `--check`/`--collect`
+igual intentan DXY, COT y el calendario, y reportan `[FALLO] real_yields: ...`
+solo para esa fuente sin tumbar el resto del proceso.
+
+### Limitaciones conocidas / sin verificar en vivo
+
+Este modulo se desarrollo en un entorno sin acceso de red a
+`api.stlouisfed.org`, `query1.finance.yahoo.com`, `stooq.com` ni
+`publicreporting.cftc.gov` (proxy de salida bloqueado), asi que **nada de
+esto se pudo probar contra las APIs reales** — solo con datos sinteticos
+mockeados (`tests/test_macro_engine.py`, 30+ tests de parseo/cache/percentil/
+zona horaria, ninguno golpea la red). Antes de confiar en el modulo, corre
+`python macro_engine.py --check` en una maquina con acceso a internet y
+revisa la salida. Puntos concretos a vigilar:
+
+- **Nombres de campo del CFTC**: el dataset de Socrata usa (segun
+  documentacion y scrapers publicos) `m_money_positions_long_all` /
+  `m_money_positions_short_all` para las posiciones de managed money. El
+  codigo prueba esos nombres con un fallback a variantes `_old`, y si
+  ninguno existe lanza un error explicito listando los campos que si
+  llegaron, en vez de devolver silenciosamente un numero incorrecto. Si
+  `--check` falla en `cot_gold` con un error de "Ninguno de los campos
+  esperados...", el dataset cambio de esquema y hay que ajustar
+  `_MM_LONG_FIELD_CANDIDATES`/`_MM_SHORT_FIELD_CANDIDATES` en
+  `macro_engine.py`.
+- **Filtro de contrato CFTC**: se filtra primero por
+  `cftc_contract_market_code='088691'` (codigo de gold COMEX) y, si no
+  devuelve filas, cae a un filtro por nombre exacto
+  (`GOLD - COMMODITY EXCHANGE INC.`). Si ambos fallan, el error lo dice
+  explicitamente en vez de devolver una lista vacia silenciosa.
+- **Sintaxis SoQL exacta** (`$where` con comparacion de fecha sobre
+  `report_date_as_yyyy_mm_dd`) no se pudo probar contra el endpoint real.
+- **FOMC**: ver arriba — lista estatica sin verificar contra
+  federalreserve.gov.
+- **DXY via yfinance**: el fallback a Stooq tampoco se pudo probar contra
+  la red real; se probo solo el parseo del formato CSV de Stooq con texto
+  sintetico.
+
 ## Correr las pruebas
 
 ```bash
 pytest tests/ -v
 ```
 
-Las pruebas usan datos OHLC **sinteticos** (random walk generado con semilla
-fija, mas variantes con huecos de precio y velas planas) para comprobar que
-`smc_engine.py` no rompe con datos raros. No sustituyen al backtest contra
-historico real.
+Las pruebas de Fase 1 usan datos OHLC **sinteticos** (random walk generado
+con semilla fija, mas variantes con huecos de precio y velas planas) para
+comprobar que `smc_engine.py` no rompe con datos raros; no sustituyen al
+backtest contra historico real. Las pruebas de Fase 2
+(`tests/test_macro_engine.py`) prueban parseo, cache, percentil y
+conversion de zona horaria con payloads sinteticos y funciones mockeadas,
+sin tocar la red; no sustituyen a `python macro_engine.py --check`.
